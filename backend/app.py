@@ -13,6 +13,8 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 
 
 EU_IOSS_COUNTRIES = {
@@ -36,6 +38,8 @@ TAX_IDS = {
     "ukvat": "Etsy's UK VAT: 370 6004 28",
 }
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "assets" / "invoice-template.pdf"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DIST_DIR = PROJECT_ROOT / "dist"
 FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 OPEN_SANS_REGULAR = FONT_DIR / "OpenSans-Regular.ttf"
 OPEN_SANS_BOLD = FONT_DIR / "OpenSans-Bold.ttf"
@@ -51,6 +55,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if (DIST_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="frontend-assets")
 
 
 @dataclass
@@ -143,6 +150,14 @@ async def get_preview_invoice_image(preview_id: str) -> Response:
     image_bytes = pixmap.tobytes("png")
     doc.close()
     return Response(content=image_bytes, media_type="image/png")
+
+
+@app.get("/{path:path}")
+async def serve_frontend(path: str) -> FileResponse:
+    requested = DIST_DIR / path
+    if path and requested.is_file():
+        return FileResponse(requested)
+    return FileResponse(DIST_DIR / "index.html")
 
 
 def render_invoice_pdf(order: InvoiceOrder) -> bytes:
