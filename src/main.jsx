@@ -30,6 +30,7 @@ const emptyOrder = {
   confidence: 0
 };
 
+
 const currencySymbols = {
   USD: "$",
   EUR: "\u20ac",
