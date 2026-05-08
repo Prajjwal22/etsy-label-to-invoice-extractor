@@ -45,6 +45,7 @@ function App() {
   const [status, setStatus] = useState("Upload an Etsy PDF label or packing slip to extract invoice details.");
   const [debugBlocks, setDebugBlocks] = useState([]);
   const [previewUrl, setPreviewUrl] = useState("");
+  const [latestImageUrl, setLatestImageUrl] = useState("");
 
   const taxMode = useMemo(() => getTaxMode(order), [order.country, order.taxOverride]);
   const invoiceValue = Number(order.invoiceValue || (taxMode === "none" ? order.subtotalExTax : order.etsyOrderValue) || 0);
@@ -63,7 +64,7 @@ function App() {
     return response.blob();
   }
 
-  async function buildPreviewUrl() {
+  async function buildPreviewUrls() {
     const response = await fetch("/api/preview-invoice", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -71,25 +72,28 @@ function App() {
     });
     if (!response.ok) throw new Error(await response.text());
     const payload = await response.json();
-    return payload.imageUrl;
+    return payload;
   }
 
   useEffect(() => {
     const hasInvoiceData = order.customerName || order.orderNumber || order.productTitle;
     if (!hasInvoiceData) {
       setPreviewUrl("");
+      setLatestImageUrl("");
       return undefined;
     }
 
     let active = true;
     const timer = window.setTimeout(async () => {
       try {
-        const url = await buildPreviewUrl();
+        const urls = await buildPreviewUrls();
         if (!active) return;
-        setPreviewUrl(url);
+        setPreviewUrl(urls.imageUrl);
+        setLatestImageUrl(urls.imageUrl);
       } catch {
         if (active) {
           setPreviewUrl("");
+          setLatestImageUrl("");
         }
       }
     }, 450);
@@ -136,10 +140,38 @@ function App() {
     }
   }
 
+  async function downloadTemplateImage() {
+    setStatus("Generating invoice image...");
+    try {
+      let imageUrl = latestImageUrl;
+      if (!imageUrl) {
+        const urls = await buildPreviewUrls();
+        imageUrl = urls.imageUrl;
+        setPreviewUrl(urls.imageUrl);
+        setLatestImageUrl(urls.imageUrl);
+      }
+      const response = await fetch(imageUrl);
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `invoice-${order.orderNumber || order.invoiceNo || "etsy"}.png`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setStatus("Downloaded invoice image.");
+    } catch (error) {
+      setStatus(`Could not download image: ${error.message}`);
+    }
+  }
+
   function reset() {
     setOrder(emptyOrder);
     setDebugBlocks([]);
     setPreviewUrl("");
+    setLatestImageUrl("");
     setStatus("Upload an Etsy PDF label or packing slip to extract invoice details.");
   }
 
@@ -153,6 +185,9 @@ function App() {
           </div>
           <button className="primary-action" type="button" onClick={downloadTemplateInvoice}>
             <Download size={18} /> Download PDF
+          </button>
+          <button type="button" onClick={downloadTemplateImage}>
+            <Download size={18} /> Download Image
           </button>
         </div>
 
@@ -170,6 +205,9 @@ function App() {
           <div className="button-row">
             <button className="primary-action" type="button" onClick={downloadTemplateInvoice}>
               <Download size={17} /> Download Canva Template PDF
+            </button>
+            <button type="button" onClick={downloadTemplateImage}>
+              <Download size={17} /> Download Image
             </button>
           </div>
         </section>
