@@ -53,6 +53,7 @@ function App() {
   const [previewUrl, setPreviewUrl] = useState("");
   const [latestImageUrl, setLatestImageUrl] = useState("");
   const [selectedFileName, setSelectedFileName] = useState("");
+  const [isDragging, setIsDragging] = useState(false);
   const [loading, setLoading] = useState({
     upload: false,
     preview: false,
@@ -119,9 +120,12 @@ function App() {
     };
   }, [order, invoiceValue]);
 
-  async function uploadPdf(event) {
-    const file = event.target.files?.[0];
+  async function handlePdfFile(file) {
     if (!file) return;
+    if (file.type && file.type !== "application/pdf") {
+      setStatus("Please upload a PDF file.");
+      return;
+    }
     setSelectedFileName(file.name);
     const form = new FormData();
     form.append("file", file);
@@ -141,12 +145,23 @@ function App() {
     }
   }
 
+  async function uploadPdf(event) {
+    await handlePdfFile(event.target.files?.[0]);
+    event.target.value = "";
+  }
+
+  async function dropPdf(event) {
+    event.preventDefault();
+    setIsDragging(false);
+    await handlePdfFile(event.dataTransfer.files?.[0]);
+  }
+
   async function downloadTemplateInvoice() {
     setStatus("Generating invoice on the Canva PDF template...");
     setLoading((current) => ({ ...current, pdf: true }));
     try {
       const blob = await buildTemplatePdf();
-      downloadBlob(blob, `invoice-${order.orderNumber || order.invoiceNo || "etsy"}.pdf`);
+      downloadBlob(blob, `${invoiceFileName(order)}.pdf`);
       setStatus("Generated invoice PDF from the Canva template.");
     } catch (error) {
       setStatus(`Could not generate invoice: ${error.message}`);
@@ -169,7 +184,7 @@ function App() {
       const response = await fetch(imageUrl);
       if (!response.ok) throw new Error(await response.text());
       const blob = await response.blob();
-      downloadBlob(blob, `invoice-${order.orderNumber || order.invoiceNo || "etsy"}.png`);
+      downloadBlob(blob, `${invoiceFileName(order)}.png`);
       setStatus("Downloaded invoice image.");
     } catch (error) {
       setStatus(`Could not download image: ${error.message}`);
@@ -193,12 +208,12 @@ function App() {
         <section className="min-w-0 space-y-4">
           <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
-              <div className="mb-5 flex items-center gap-3 text-owleaf">
-                <span className="grid size-9 place-items-center rounded-lg bg-owleaf text-white">
-                  <Leaf size={20} />
-                </span>
-                <span className="text-2xl font-extrabold tracking-tight">Owleaf</span>
-              </div>
+                <div className="mb-5 flex items-center gap-3 text-owleaf">
+                  <span className="grid size-9 place-items-center rounded-lg bg-owleaf text-white">
+                    <Leaf size={20} />
+                  </span>
+                  <span className="text-2xl font-extrabold tracking-tight">Owleaf</span>
+                </div>
               <h1 className="text-3xl font-black tracking-tight text-slate-950 sm:text-4xl">Etsy Invoice Generator</h1>
               <p className="mt-3 max-w-md text-sm leading-6 text-slate-600 sm:text-base">
                 Upload an Etsy PDF, review extracted fields, then download the invoice.
@@ -215,9 +230,28 @@ function App() {
           </header>
 
           <Panel title="Import Etsy PDF" action={<button className={secondaryButton} type="button" onClick={reset}><RotateCcw size={16} /> Reset</button>}>
-            <label className="grid min-h-28 cursor-pointer place-items-center rounded-xl border border-dashed border-owleaf/30 bg-white px-4 py-5 text-center text-sm font-bold text-owleaf transition hover:bg-owleaf-soft">
+            <label
+              className={`grid min-h-28 cursor-pointer place-items-center rounded-xl border border-dashed px-4 py-5 text-center text-sm font-bold transition ${
+                isDragging
+                  ? "border-owleaf bg-owleaf-soft text-owleaf-dark ring-4 ring-owleaf/10"
+                  : "border-owleaf/30 bg-white text-owleaf hover:bg-owleaf-soft"
+              }`}
+              onDragEnter={(event) => {
+                event.preventDefault();
+                setIsDragging(true);
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setIsDragging(true);
+              }}
+              onDragLeave={(event) => {
+                event.preventDefault();
+                setIsDragging(false);
+              }}
+              onDrop={dropPdf}
+            >
               <FileUp size={30} />
-              <span className="mt-2">{loading.upload ? "Reading Etsy PDF..." : "Choose Etsy PDF label / packing slip"}</span>
+              <span className="mt-2">{loading.upload ? "Reading Etsy PDF..." : isDragging ? "Drop PDF here" : "Choose or drag Etsy PDF label / packing slip"}</span>
               <input className="hidden" type="file" accept="application/pdf,.pdf" onChange={uploadPdf} disabled={loading.upload} />
             </label>
 
@@ -356,6 +390,20 @@ function downloadBlob(blob, filename) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+function invoiceFileName(order) {
+  const customer = safeFilePart(order.customerName || "Customer");
+  const invoice = safeFilePart(order.invoiceNo || "Invoice");
+  return `${customer} ${invoice}`.trim();
+}
+
+function safeFilePart(value) {
+  return String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
 }
 
 function getTaxMode(order) {
