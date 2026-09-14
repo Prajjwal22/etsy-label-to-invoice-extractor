@@ -27,7 +27,10 @@ const emptyOrder = {
   invoiceValue: 0,
   currency: "USD",
   taxOverride: "auto",
-  confidence: 0
+  confidence: 0,
+  isGift: false,
+  conversion: null,
+  conversionWarning: ""
 };
 
 const currencySymbols = {
@@ -36,7 +39,16 @@ const currencySymbols = {
   GBP: "\u00a3",
   AUD: "A$",
   CAD: "C$",
-  INR: "\u20b9"
+  INR: "\u20b9",
+  BGN: "\u043b\u0432",
+  CHF: "CHF",
+  CZK: "K\u010d",
+  DKK: "kr",
+  HUF: "Ft",
+  NOK: "kr",
+  PLN: "z\u0142",
+  RON: "lei",
+  SEK: "kr"
 };
 
 const inputClass = "min-h-10 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-950 outline-none transition focus:border-owleaf focus:ring-4 focus:ring-owleaf/10";
@@ -137,7 +149,13 @@ function App() {
       const payload = await response.json();
       setOrder({ ...emptyOrder, ...payload.order });
       setDebugBlocks(payload.debug?.blocks || []);
-      setStatus(`Imported successfully. Confidence: ${payload.order.confidence || 0}%. Review, then download.`);
+      const conversion = payload.order.conversion;
+      const conversionNote = conversion
+        ? ` Converted ${conversion.sourceCurrency} to ${conversion.destinationCurrency} at ${conversion.rate} (${conversion.rateDate}).`
+        : payload.order.conversionWarning
+          ? ` ${payload.order.conversionWarning}`
+          : "";
+      setStatus(`Imported successfully. Confidence: ${payload.order.confidence || 0}%.${conversionNote} Review, then download.`);
     } catch (error) {
       setStatus(`Could not parse PDF: ${error.message}`);
     } finally {
@@ -287,13 +305,25 @@ function App() {
               <Field label="Order #" value={order.orderNumber} onChange={(value) => updateField("orderNumber", value)} />
               <label className={labelClass}>Currency
                 <select className={inputClass} value={order.currency} onChange={(event) => updateField("currency", event.target.value)}>
-                  {["USD", "EUR", "GBP", "AUD", "CAD", "INR"].map((item) => <option key={item} value={item}>{item} {currencySymbols[item]}</option>)}
+                  {["USD", "EUR", "GBP", "AUD", "CAD", "INR", "BGN", "CHF", "CZK", "DKK", "HUF", "NOK", "PLN", "RON", "SEK"].map((item) => <option key={item} value={item}>{item} {currencySymbols[item]}</option>)}
                 </select>
               </label>
               <Field label="Quantity" type="number" value={order.quantity} onChange={(value) => updateField("quantity", value)} />
               <Field label="Invoice Value" type="number" value={invoiceValue} onChange={(value) => updateField("invoiceValue", value)} />
               <Field label="Subtotal (Excluding Tax)" type="number" value={order.subtotalExTax} onChange={(value) => updateField("subtotalExTax", value)} />
               <Field label="Order Total (Etsy)" type="number" value={order.etsyOrderValue} onChange={(value) => updateField("etsyOrderValue", value)} />
+              {order.conversion && (
+                <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-800 sm:col-span-2">
+                  {order.isGift ? "Gift order: " : ""}{currencySymbols[order.conversion.sourceCurrency] || order.conversion.sourceCurrency}
+                  {Number(order.conversion.sourceInvoiceValue || 0).toFixed(2)} converted to {currencySymbols[order.currency] || order.currency}
+                  {Number(order.invoiceValue || 0).toFixed(2)} using {order.conversion.provider} rate {order.conversion.rate} from {order.conversion.rateDate}.
+                </p>
+              )}
+              {order.conversionWarning && (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800 sm:col-span-2">
+                  {order.conversionWarning}
+                </p>
+              )}
             </div>
           </Panel>
 

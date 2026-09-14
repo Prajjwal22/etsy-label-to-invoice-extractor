@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -40,7 +46,33 @@ CURRENCY_SYMBOLS = {
     # Retain support for text that has already been decoded as mojibake.
     "â‚¬": "EUR", "Â£": "GBP", "â‚¹": "INR",
 }
-DISPLAY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "AUD": "A$", "CAD": "C$", "INR": "₹"}
+DISPLAY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "GBP": "£", "AUD": "A$", "CAD": "C$", "INR": "₹",
+    "BGN": "лв", "CHF": "CHF", "CZK": "Kč", "DKK": "kr", "HUF": "Ft",
+    "NOK": "kr", "PLN": "zł", "RON": "lei", "SEK": "kr",
+}
+COUNTRY_CURRENCIES = {
+    "united states": "USD",
+    "united kingdom": "GBP",
+    "uk": "GBP",
+    "great britain": "GBP",
+    "canada": "CAD",
+    "australia": "AUD",
+    "switzerland": "CHF",
+    "norway": "NOK",
+    "czech republic": "CZK",
+    "czechia": "CZK",
+    "denmark": "DKK",
+    "hungary": "HUF",
+    "poland": "PLN",
+    "romania": "RON",
+    "sweden": "SEK",
+}
+EURO_COUNTRIES = EU_IOSS_COUNTRIES - {
+    "czech republic", "czechia", "denmark", "hungary", "poland", "romania", "sweden",
+}
+EXCHANGE_RATE_URL = "https://api.frankfurter.dev/v2/providers/ecb/rate/{base}/{quote}"
+EXCHANGE_RATE_CACHE: dict[tuple[str, str, str], tuple[Decimal, str]] = {}
 ADDRESS_HEADER_RE = re.compile(
     r"^(?:Ship to|Deliver(?:y)? to|Versand an)(?:\s*:)?$",
     re.IGNORECASE,
@@ -120,6 +152,7 @@ async def parse_pdf(file: UploadFile = File(...)) -> dict[str, Any]:
     data = await file.read()
     blocks = extract_blocks(data)
     parsed = parse_etsy_blocks(blocks)
+    parsed = await asyncio.to_thread(convert_order_to_destination_currency, parsed)
     return {
         "order": parsed,
         "debug": {
@@ -459,6 +492,7 @@ def normalize_text(value: str) -> str:
 
 def parse_etsy_blocks(blocks: list[Block]) -> dict[str, Any]:
     all_text = "\n".join(block.text for block in blocks)
+    is_gift = bool(re.search(r"^(?:Marked as gift|Als Geschenk markiert)$", all_text, re.IGNORECASE | re.MULTILINE))
     ship_block = next(
         (block for block in blocks if block.lines and ADDRESS_HEADER_RE.match(block.lines[0])),
         None,
@@ -496,6 +530,7 @@ def parse_etsy_blocks(blocks: list[Block]) -> dict[str, Any]:
         "currency": totals["currency"] or currency_from_country(country),
         "taxOverride": "auto",
         "taxMode": tax_mode,
+        "isGift": is_gift,
         "confidence": confidence_score(address, title, sku, order_number, invoice_value),
     }
 
@@ -652,11 +687,89 @@ def infer_tax_mode(country: str) -> str:
     return "none"
 
 
+def convert_order_to_destination_currency(order: dict[str, Any]) -> dict[str, Any]:
+    source_currency = str(order.get("currency") or "").upper()
+    destination_currency = currency_from_country(str(order.get("country") or ""))
+    if source_currency != "INR" or not destination_currency or destination_currency == source_currency:
+        return order
+
+    order_date = str(order.get("invoiceDate") or "")
+    original_amounts = {
+        field: order.get(field, 0)
+        for field in ("unitPrice", "subtotalExTax", "etsyOrderValue", "invoiceValue")
+    }
+    try:
+        rate, rate_date = fetch_exchange_rate(source_currency, destination_currency, order_date)
+    except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as error:
+        order["conversionWarning"] = (
+            f"Could not convert {source_currency} to {destination_currency}: {error}. "
+            f"Amounts remain in {source_currency}."
+        )
+        return order
+
+    for field, value in original_amounts.items():
+        order[field] = convert_money(value, rate)
+    order["currency"] = destination_currency
+    order["conversion"] = {
+        "sourceCurrency": source_currency,
+        "destinationCurrency": destination_currency,
+        "rate": float(rate),
+        "rateDate": rate_date,
+        "provider": "ECB via Frankfurter",
+        "sourceInvoiceValue": original_amounts["invoiceValue"],
+    }
+    return order
+
+
+def fetch_exchange_rate(base: str, quote: str, requested_date: str) -> tuple[Decimal, str]:
+    base = base.upper()
+    quote = quote.upper()
+    if not re.fullmatch(r"[A-Z]{3}", base) or not re.fullmatch(r"[A-Z]{3}", quote):
+        raise ValueError("invalid currency code")
+    if requested_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_date):
+        raise ValueError("invalid exchange-rate date")
+
+    cache_key = (base, quote, requested_date)
+    if cache_key in EXCHANGE_RATE_CACHE:
+        return EXCHANGE_RATE_CACHE[cache_key]
+
+    query = urllib.parse.urlencode({"date": requested_date}) if requested_date else ""
+    url = EXCHANGE_RATE_URL.format(base=base.lower(), quote=quote.lower())
+    if query:
+        url = f"{url}?{query}"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "Owleaf-Invoice-Generator/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = json.load(response)
+
+    try:
+        rate = Decimal(str(payload["rate"]))
+        rate_date = str(payload["date"])
+    except (KeyError, InvalidOperation, TypeError) as error:
+        raise ValueError("exchange-rate service returned an invalid response") from error
+    if rate <= 0:
+        raise ValueError("exchange-rate service returned a non-positive rate")
+
+    result = (rate, rate_date)
+    EXCHANGE_RATE_CACHE[cache_key] = result
+    return result
+
+
+def convert_money(value: Any, rate: Decimal) -> float:
+    try:
+        amount = Decimal(str(value or 0))
+    except InvalidOperation:
+        amount = Decimal("0")
+    return float((amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def currency_from_country(country: str) -> str:
     normalized = country.lower().strip()
-    if normalized in {"united kingdom", "uk", "great britain"}:
-        return "GBP"
-    if normalized in EU_IOSS_COUNTRIES:
+    if normalized in COUNTRY_CURRENCIES:
+        return COUNTRY_CURRENCIES[normalized]
+    if normalized in EURO_COUNTRIES:
         return "EUR"
     return "USD"
 
