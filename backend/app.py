@@ -29,10 +29,28 @@ COUNTRIES = [
     "United States", "United Kingdom", "France", "Germany", "Italy", "Spain",
     "Canada", "Australia", "Netherlands", "Sweden", "Ireland", "Belgium",
     "Austria", "Denmark", "Portugal", "Poland", "Norway", "Switzerland",
+    "Bulgaria", "Croatia", "Cyprus", "Czech Republic", "Czechia", "Estonia",
+    "Finland", "Greece", "Hungary", "Latvia", "Lithuania", "Luxembourg",
+    "Malta", "Romania", "Slovakia", "Slovenia",
 ]
 
-CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
+CURRENCY_SYMBOLS = {
+    "A$": "AUD", "AU$": "AUD", "C$": "CAD", "CA$": "CAD", "US$": "USD",
+    "€": "EUR", "£": "GBP", "$": "USD", "₹": "INR",
+    # Retain support for text that has already been decoded as mojibake.
+    "â‚¬": "EUR", "Â£": "GBP", "â‚¹": "INR",
+}
 DISPLAY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "AUD": "A$", "CAD": "C$", "INR": "₹"}
+ADDRESS_HEADER_RE = re.compile(
+    r"^(?:Ship to|Deliver(?:y)? to|Versand an)(?:\s*:)?$",
+    re.IGNORECASE,
+)
+TOTAL_LABELS = {
+    "item_total": ("item total", "gesamtbetrag artikel"),
+    "subtotal": ("subtotal", "zwischensumme"),
+    "tax": ("tax", "steuer"),
+    "order_total": ("order total", "gesamtsumme der bestellung"),
+}
 TAX_IDS = {
     "ioss": "Etsy's IOSS: IM3720000224",
     "ukvat": "Etsy's UK VAT: 370 6004 28",
@@ -441,12 +459,18 @@ def normalize_text(value: str) -> str:
 
 def parse_etsy_blocks(blocks: list[Block]) -> dict[str, Any]:
     all_text = "\n".join(block.text for block in blocks)
-    ship_block = first_block(blocks, r"^(Ship to|Deliver to)\b")
+    ship_block = next(
+        (block for block in blocks if block.lines and ADDRESS_HEADER_RE.match(block.lines[0])),
+        None,
+    )
     address = parse_address_block(ship_block)
     country = address["country"] or parse_country(all_text)
     totals = parse_customer_currency_totals(blocks)
     order_number = regex_value(all_text, r"Order\s*#?\s*(\d{6,})")
-    order_date = parse_date(regex_value(all_text, r"Order date\s*([\d]{1,2}\s+[A-Za-z]+,?\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})"))
+    order_date = parse_date(regex_value(
+        all_text,
+        r"(?:Order date|Bestelldatum)\s*([\d]{1,2}\s+[A-Za-z]+,?\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})",
+    ))
     sku = regex_value(all_text, r"SKU:\s*([A-Z0-9][A-Z0-9_-]+)")
     quantity = parse_quantity(blocks) or 1
     title = parse_title(blocks, sku)
@@ -485,7 +509,7 @@ def parse_address_block(block: Block | None) -> dict[str, Any]:
     if not block:
         return {"customer_name": "", "address_lines": [], "country": ""}
     lines = block.lines
-    if lines and re.match(r"^(Ship to|Deliver to)$", lines[0], re.IGNORECASE):
+    if lines and ADDRESS_HEADER_RE.match(lines[0]):
         lines = lines[1:]
     country = lines[-1] if lines and is_country(lines[-1]) else ""
     body = lines[:-1] if country else lines
@@ -509,40 +533,65 @@ def is_country(value: str) -> bool:
 
 
 def parse_customer_currency_totals(blocks: list[Block]) -> dict[str, Any]:
-    totals = {"currency": "", "item_total": 0.0, "subtotal": 0.0, "tax": 0.0, "order_total": 0.0}
-    customer_blocks = [block for block in blocks if "INR" not in block.text and block.x0 > 350]
-    for block in customer_blocks:
+    empty = {"currency": "", "item_total": 0.0, "subtotal": 0.0, "tax": 0.0, "order_total": 0.0}
+    totals_by_page: dict[int, dict[str, Any]] = {}
+
+    for block in blocks:
         lines = block.lines
         if len(lines) < 2:
             continue
-        label = lines[0].lower()
-        amount, currency = parse_money(lines[-1])
-        if currency and not totals["currency"]:
-            totals["currency"] = currency
-        if "item total" in label:
-            totals["item_total"] = amount
-        elif "subtotal" in label:
-            totals["subtotal"] = amount
-        elif label == "tax":
-            totals["tax"] = amount
-        elif "order total" in label:
-            totals["order_total"] = amount
-    return totals
+        label = lines[0].casefold().rstrip(":")
+        field = next(
+            (name for name, labels in TOTAL_LABELS.items() if label in labels),
+            "",
+        )
+        if not field:
+            continue
+        amount, currency = parse_money(" ".join(lines[1:]))
+        page_totals = totals_by_page.setdefault(block.page, empty.copy())
+        page_totals[field] = amount
+        if currency:
+            page_totals["currency"] = currency
+
+    candidates = [totals for totals in totals_by_page.values() if any(totals[name] for name in TOTAL_LABELS)]
+    if not candidates:
+        return empty
+
+    # Prefer a localized buyer copy to Etsy's seller-currency copy. Some PDFs
+    # contain only the latter, so INR remains a valid, truthful fallback.
+    buyer_currency = [totals for totals in candidates if totals["currency"] and totals["currency"] != "INR"]
+    pool = buyer_currency or candidates
+    return max(
+        pool,
+        key=lambda totals: (bool(totals["order_total"]), sum(bool(totals[name]) for name in TOTAL_LABELS)),
+    )
 
 
 def parse_money(value: str) -> tuple[float, str]:
     currency = ""
-    for symbol, code in CURRENCY_SYMBOLS.items():
-        if symbol in value:
-            currency = code
-            break
-    code_match = re.search(r"\b(USD|EUR|GBP|AUD|CAD)\b", value, re.IGNORECASE)
+    code_match = re.search(r"\b(USD|EUR|GBP|AUD|CAD|INR)\b", value, re.IGNORECASE)
     if code_match:
         currency = code_match.group(1).upper()
-    number_match = re.search(r"(-?\s*)?([0-9][0-9,]*(?:\.[0-9]{2})?)", value)
+    else:
+        for symbol, code in CURRENCY_SYMBOLS.items():
+            if symbol in value:
+                currency = code
+                break
+    number_match = re.search(r"-?\s*[0-9][0-9.,\s]*", value)
     if not number_match:
         return 0.0, currency
-    amount = float(number_match.group(0).replace(" ", "").replace(",", ""))
+    number = number_match.group(0).replace(" ", "")
+    negative = number.startswith("-")
+    number = number.lstrip("-")
+    if "," in number and "." in number:
+        decimal_separator = "," if number.rfind(",") > number.rfind(".") else "."
+        thousands_separator = "." if decimal_separator == "," else ","
+        number = number.replace(thousands_separator, "").replace(decimal_separator, ".")
+    elif "," in number:
+        number = number.replace(",", ".") if len(number.rsplit(",", 1)[1]) == 2 else number.replace(",", "")
+    elif "." in number and len(number.rsplit(".", 1)[1]) != 2:
+        number = number.replace(".", "")
+    amount = float(number) * (-1 if negative else 1)
     return amount, currency
 
 
@@ -552,7 +601,11 @@ def parse_quantity(blocks: list[Block]) -> int:
             match = re.search(r"\b(\d+)\s*x\s*", block.text)
             if match:
                 return int(match.group(1))
-    match = re.search(r"\b(\d+)\s+item\b", "\n".join(block.text for block in blocks), re.IGNORECASE)
+    all_text = "\n".join(block.text for block in blocks)
+    match = re.search(r"\b(\d+)\s+item\b", all_text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\bQuantity:\s*(\d+)\b", all_text, re.IGNORECASE)
     return int(match.group(1)) if match else 0
 
 
@@ -581,7 +634,7 @@ def regex_value(text: str, pattern: str) -> str:
 
 
 def parse_date(value: str) -> str:
-    value = value.replace(",", "").strip()
+    value = re.sub(r"\bSept\b", "Sep", value.replace(",", ""), flags=re.IGNORECASE).strip()
     for fmt in ("%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y"):
         try:
             return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
